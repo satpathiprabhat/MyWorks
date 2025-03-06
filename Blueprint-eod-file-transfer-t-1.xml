@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<blueprint xmlns="http://www.osgi.org/xmlns/blueprint/v1.0.0"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xsi:schemaLocation="http://www.osgi.org/xmlns/blueprint/v1.0.0 
+           http://www.osgi.org/xmlns/blueprint/v1.0.0/blueprint.xsd">
+
+    <camelContext id="camel" xmlns="http://camel.apache.org/schema/blueprint">
+        <route id="file-to-sftp">
+            <!-- Read files from local folder -->
+            <from uri="file:/local/source/folder?noop=true"/>
+
+            <!-- Set property for backdated folder -->
+            <setProperty name="yesterday">
+                <simple>${date:now-86400000:yyyyMMdd}</simple>
+            </setProperty>
+
+            <!-- Set header using the property -->
+            <setHeader name="sftpFolder">
+                <simple>target/folder/${property.yesterday}/</simple>
+            </setHeader>
+
+            <!-- Set dynamic SFTP URI -->
+            <setHeader name="sftpUri">
+                <simple>sftp://sftp.server.com/${header.sftpFolder}?username={{sftp.username}}&password={{sftp.password}}&binary=true</simple>
+            </setHeader>
+
+            <!-- Transfer files dynamically -->
+            <toD uri="${header.sftpUri}"/>
+        </route>
+
+        <route id="create-done-file">
+            <!-- Wait until all files are transferred -->
+            <from uri="file:/local/source/folder?noop=true&idempotent=true"/>
+            
+            <!-- Aggregate completion -->
+            <aggregate strategyRef="groupedExchangeStrategy" completionTimeout="5000">
+                <correlationExpression>
+                    <constant>true</constant>
+                </correlationExpression>
+
+                <completionSize>
+                    <simple>${exchangeProperty.CamelBatchSize}</simple>
+                </completionSize>
+
+                <to uri="file:/local/source/folder?fileName=done.txt"/>
+            </aggregate>
+        </route>
+    </camelContext>
+
+    <bean id="groupedExchangeStrategy" class="org.apache.camel.processor.aggregate.GroupedExchangeAggregationStrategy"/>
+</blueprint>
