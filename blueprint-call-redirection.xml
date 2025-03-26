@@ -1,0 +1,51 @@
+<blueprint xmlns="http://www.osgi.org/xmlns/blueprint/v1.0.0"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xsi:schemaLocation="
+           http://www.osgi.org/xmlns/blueprint/v1.0.0 
+           http://www.osgi.org/xmlns/blueprint/v1.0.0/blueprint.xsd">
+
+    <!-- Apache Camel Context -->
+    <camelContext id="camelContext" xmlns="http://camel.apache.org/schema/blueprint">
+
+        <!-- Error Handling Strategy -->
+        <onException>
+            <exception>java.io.IOException</exception>
+            <exception>org.apache.http.conn.HttpHostConnectException</exception>
+            <redeliveryPolicy maximumRedeliveries="3" redeliveryDelay="2000"/>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <log message="Exception occurred during request forwarding: ${exception.message}" loggingLevel="ERROR"/>
+        </onException>
+
+        <!-- Main Route for Request Redirection -->
+        <route id="request-forwarding-route">
+            <from uri="jetty:http://0.0.0.0:8080/api/inbound"/>
+            
+            <!-- Request Transformation (Optional) -->
+            <setHeader name="CamelHttpMethod">
+                <constant>POST</constant>
+            </setHeader>
+
+            <!-- HTTP Client Configuration -->
+            <toD uri="http4://thirdparty.com/api/external?connectionClose=true&amp;bridgeEndpoint=true"
+                 timeout="5000"
+                 socketTimeout="10000"
+                 maxTotalConnections="200"
+                 connectionsPerRoute="50"/>
+
+            <!-- Response Handling -->
+            <log message="Response successfully forwarded to original caller."/>
+        </route>
+    </camelContext>
+
+    <!-- HTTP Client Configuration -->
+    <bean id="httpClientConfigurer" class="org.apache.camel.component.http4.HttpClientConfigurer">
+        <property name="maxTotalConnections" value="200"/>
+        <property name="connectionsPerRoute" value="50"/>
+        <property name="socketTimeout" value="10000"/>
+        <property name="connectionTimeout" value="5000"/>
+        <property name="soTimeout" value="15000"/>
+    </bean>
+
+</blueprint>
