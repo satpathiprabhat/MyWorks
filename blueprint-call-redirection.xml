@@ -4,48 +4,57 @@
            http://www.osgi.org/xmlns/blueprint/v1.0.0 
            http://www.osgi.org/xmlns/blueprint/v1.0.0/blueprint.xsd">
 
-    <!-- Apache Camel Context -->
     <camelContext id="camelContext" xmlns="http://camel.apache.org/schema/blueprint">
 
-        <!-- Error Handling Strategy -->
+        <!-- Exception Handling -->
         <onException>
-            <exception>java.io.IOException</exception>
+            <exception>java.net.SocketTimeoutException</exception>
             <exception>org.apache.http.conn.HttpHostConnectException</exception>
             <redeliveryPolicy maximumRedeliveries="3" redeliveryDelay="2000"/>
             <handled>
                 <constant>true</constant>
             </handled>
-            <log message="Exception occurred during request forwarding: ${exception.message}" loggingLevel="ERROR"/>
+            <log message="Exception during request forwarding: ${exception.message}" loggingLevel="ERROR"/>
         </onException>
 
-        <!-- Main Route for Request Redirection -->
+        <!-- Main Route for Dynamic Endpoint Resolution -->
         <route id="request-forwarding-route">
-            <from uri="jetty:http://0.0.0.0:8080/api/inbound"/>
-            
-            <!-- Request Transformation (Optional) -->
+            <from uri="jetty:http://0.0.0.0:8080/api/inbound?httpMethodRestrict=POST"/>
+
+            <!-- Set HTTP Method and Content Type -->
             <setHeader name="CamelHttpMethod">
                 <constant>POST</constant>
             </setHeader>
 
-            <!-- HTTP Client Configuration -->
-            <toD uri="http4://thirdparty.com/api/external?connectionClose=true&amp;bridgeEndpoint=true"
-                 timeout="5000"
-                 socketTimeout="10000"
-                 maxTotalConnections="200"
-                 connectionsPerRoute="50"/>
+            <setHeader name="Content-Type">
+                <constant>application/json</constant>
+            </setHeader>
 
-            <!-- Response Handling -->
-            <log message="Response successfully forwarded to original caller."/>
+            <!-- Dynamic Endpoint with Connection Settings -->
+            <toD uri="http4://thirdparty.com/api/external?
+                     bridgeEndpoint=true
+                     &connectionClose=true
+                     &throwExceptionOnFailure=true
+                     &httpClientConfigurer=#httpClientConfigurer"/>
+
+            <log message="Response successfully forwarded."/>
         </route>
     </camelContext>
 
     <!-- HTTP Client Configuration -->
     <bean id="httpClientConfigurer" class="org.apache.camel.component.http4.HttpClientConfigurer">
-        <property name="maxTotalConnections" value="200"/>
-        <property name="connectionsPerRoute" value="50"/>
-        <property name="socketTimeout" value="10000"/>
-        <property name="connectionTimeout" value="5000"/>
-        <property name="soTimeout" value="15000"/>
+        <argument>
+            <bean class="org.apache.http.impl.client.HttpClients">
+                <factory-method name="custom">
+                    <argument>
+                        <bean class="org.apache.http.impl.client.HttpClientBuilder">
+                            <property name="maxConnTotal" value="200"/>
+                            <property name="maxConnPerRoute" value="50"/>
+                            <property name="connectionTimeToLive" value="30"/>
+                        </bean>
+                    </argument>
+                </factory-method>
+            </bean>
+        </argument>
     </bean>
-
 </blueprint>
