@@ -183,3 +183,80 @@ public class TotpService {
    ```
 
 These changes will ensure your TOTP implementation consistently uses 90-second windows and properly reports remaining validity time. The OTPs should now always be valid for exactly 90 seconds from their generation time.
+
+
+
+import org.apache.commons.codec.binary.Base32;
+import org.apache.commons.codec.binary.Hex;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
+import java.time.Instant;
+
+@Service
+public class TotpService {
+
+    private static final String HMAC_ALGORITHM = "HmacSHA256";
+    private static final int TIME_STEP = 90; // 90-second window
+    private static final int CODE_DIGITS = 6; // 6-digit code
+    
+    // Generate a random Base32 secret
+    public String generateSecret() {
+        Base32 base32 = new Base32();
+        byte[] randomBytes = new byte[20]; // 160 bits recommended for HMAC-SHA256
+        new java.security.SecureRandom().nextBytes(randomBytes);
+        return base32.encodeToString(randomBytes);
+    }
+    
+    // Generate TOTP code
+    public String generateTotp(String secret) {
+        long counter = Instant.now().getEpochSecond() / TIME_STEP;
+        return generateHotp(secret, counter, CODE_DIGITS);
+    }
+    
+    // Verify TOTP code
+    public boolean verifyTotp(String secret, String code) {
+        long counter = Instant.now().getEpochSecond() / TIME_STEP;
+        
+        // Check current window
+        if (generateHotp(secret, counter, CODE_DIGITS).equals(code)) {
+            return true;
+        }
+        
+        // Check previous window (for clock drift)
+        if (generateHotp(secret, counter - 1, CODE_DIGITS).equals(code)) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    private String generateHotp(String secret, long counter, int digits) {
+        try {
+            Base32 base32 = new Base32();
+            byte[] keyBytes = base32.decode(secret);
+            byte[] counterBytes = java.nio.ByteBuffer.allocate(8).putLong(counter).array();
+            
+            SecretKeySpec signKey = new SecretKeySpec(keyBytes, HMAC_ALGORITHM);
+            Mac mac = Mac.getInstance(HMAC_ALGORITHM);
+            mac.init(signKey);
+            
+            byte[] hash = mac.doFinal(counterBytes);
+            
+            int offset = hash[hash.length - 1] & 0xf;
+            long binary = ((hash[offset] & 0x7f) << 24) |
+                         ((hash[offset + 1] & 0xff) << 16) |
+                         ((hash[offset + 2] & 0xff) << 8) |
+                         (hash[offset + 3] & 0xff);
+            
+            long otp = binary % (long) Math.pow(10, digits);
+            return String.format("%0" + digits + "d", otp);
+            
+        } catch (NoSuchAlgorithmException | InvalidKeyException e) {
+            throw new RuntimeException("Error generating HOTP code", e);
+        }
+    }
+}
