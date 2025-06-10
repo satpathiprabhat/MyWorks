@@ -2,56 +2,63 @@ import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator;
 
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
 import java.security.NoSuchAlgorithmException;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.concurrent.TimeUnit;
 
 public class OtpService {
 
-    private static final Duration OTP_TIME_STEP = Duration.ofSeconds(30); // each step = 30 sec
-    private static final int VALIDITY_SECONDS = 90; // OTP valid for 90 seconds
+    private static final int OTP_DIGITS = 6;
+    private static final long TIME_STEP_SECONDS = 30;
+    private static final long VALIDITY_SECONDS = 90;
 
     private final TimeBasedOneTimePasswordGenerator totpGenerator;
 
     public OtpService() throws NoSuchAlgorithmException {
-        this.totpGenerator = new TimeBasedOneTimePasswordGenerator(OTP_TIME_STEP);
+        this.totpGenerator = new TimeBasedOneTimePasswordGenerator(TIME_STEP_SECONDS, TimeUnit.SECONDS);
     }
 
-    public String generateOtp(String base64SecretKey) throws Exception {
-        SecretKey secretKey = decodeBase64Key(base64SecretKey);
-        Instant now = Instant.now();
-        return String.format("%06d", totpGenerator.generateOneTimePassword(secretKey, now));
+    // Generate a new base64 encoded secret key (called only on OTP generation)
+    public static String generateSecretKey() throws NoSuchAlgorithmException {
+        KeyGenerator keyGen = KeyGenerator.getInstance("HmacSHA1");
+        keyGen.init(160); // 160 bits for SHA1
+        SecretKey key = keyGen.generateKey();
+        return Base64.getEncoder().encodeToString(key.getEncoded());
     }
 
-    private SecretKey decodeBase64Key(String base64) {
-        byte[] decodedKey = Base64.getDecoder().decode(base64);
-        return new javax.crypto.spec.SecretKeySpec(decodedKey, "HmacSHA1");
+    // Generate OTP based on secret
+    public String generateOtp(String base64Secret) throws Exception {
+        SecretKey key = decodeBase64Key(base64Secret);
+        long counter = getCurrentCounter();
+        int otp = totpGenerator.generateOneTimePassword(key, counter);
+        return String.format("%0" + OTP_DIGITS + "d", otp);
     }
 
-    public boolean validateOtp(String otp, String base64SecretKey) throws Exception {
-        SecretKey secretKey = decodeBase64Key(base64SecretKey);
-        Instant now = Instant.now();
+    // Validate OTP with ± (VALIDITY_SECONDS / TIME_STEP_SECONDS) / 2 window
+    public boolean validateOtp(String base64Secret, String inputOtp) throws Exception {
+        SecretKey key = decodeBase64Key(base64Secret);
+        long currentCounter = getCurrentCounter();
+        int window = (int)(VALIDITY_SECONDS / TIME_STEP_SECONDS) / 2;
 
-        // Acceptable window = VALIDITY_SECONDS / OTP_TIME_STEP
-        int steps = VALIDITY_SECONDS / (int) OTP_TIME_STEP.getSeconds();
-
-        for (int i = -steps / 2; i <= steps / 2; i++) {
-            Instant comparisonTime = now.plusSeconds(i * OTP_TIME_STEP.getSeconds());
-            String candidateOtp = String.format("%06d", totpGenerator.generateOneTimePassword(secretKey, comparisonTime));
-            if (candidateOtp.equals(otp)) {
+        for (int i = -window; i <= window; i++) {
+            long counterToTry = currentCounter + i;
+            int candidate = totpGenerator.generateOneTimePassword(key, counterToTry);
+            String formatted = String.format("%0" + OTP_DIGITS + "d", candidate);
+            if (formatted.equals(inputOtp)) {
                 return true;
             }
         }
-
         return false;
     }
 
-    // To generate a new secret key (on server side)
-    public static String generateBase64SecretKey() throws NoSuchAlgorithmException {
-        KeyGenerator keyGenerator = KeyGenerator.getInstance("HmacSHA1");
-        keyGenerator.init(160); // RFC recommends at least 160 bits for SHA-1
-        SecretKey key = keyGenerator.generateKey();
-        return Base64.getEncoder().encodeToString(key.getEncoded());
+    private long getCurrentCounter() {
+        return Instant.now().getEpochSecond() / TIME_STEP_SECONDS;
+    }
+
+    private SecretKey decodeBase64Key(String base64Key) {
+        byte[] decoded = Base64.getDecoder().decode(base64Key);
+        return new SecretKeySpec(decoded, "HmacSHA1");
     }
 }
