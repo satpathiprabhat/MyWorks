@@ -13,8 +13,8 @@ EXCEL_FILES = [
     "file4.xlsx",
     "file5.xlsx"
 ]
-COLUMNS_TO_CHECK = ["CustomerID", "ColumnA", "ColumnB"]  # Columns in Excel
-OUTPUT_FILE = "search_results_multi_column.csv"
+COLUMNS_TO_CHECK = ["CustomerID", "ColumnA", "ColumnB"]  # Columns to read from Excel
+OUTPUT_FILE = "customer_details_output.csv"
 
 
 # ==============================
@@ -26,45 +26,60 @@ def load_customer_numbers(file_path):
         return [line.strip() for line in f if line.strip()]
 
 
-def check_customers_in_excel(customer_numbers, excel_file, columns_to_check):
+def extract_columns_from_excel(customer_numbers, excel_file, columns_to_check):
     """
-    Read Excel once and check all customer numbers with other columns.
-    Returns dict: {customer_number: True/False}
+    Read Excel once and extract ColumnA and ColumnB for each customer number.
+    Returns dict: {customer_number: (ColumnA_value, ColumnB_value) or (None, None)}
     """
-    # Read only the relevant columns
     df = pd.read_excel(excel_file, usecols=columns_to_check, engine="openpyxl")
     
     # Normalize all data to string and strip
     for col in columns_to_check:
         df[col] = df[col].astype(str).str.strip()
     
-    # Create a set of tuples for all rows
-    excel_tuples = set([tuple(row) for row in df[columns_to_check].values])
-    
-    # Check each customer number with placeholder values for other columns
-    # Since flat file has only customer number, we match only CustomerID
+    # Create mapping: CustomerID -> (ColumnA, ColumnB)
+    customer_map = {}
+    for row in df.itertuples(index=False):
+        customer_map[row[0]] = (row[1], row[2])  # ColumnA, ColumnB
+
+    # Prepare results for all customers in flat file
     results = {}
     for cust in customer_numbers:
-        # Create tuple with customer number in first position, others as wildcards
-        match = any(t[0] == cust for t in excel_tuples)
-        results[cust] = match
+        if cust in customer_map:
+            results[cust] = customer_map[cust]
+        else:
+            results[cust] = (None, None)  # Not found
     
     return results
 
 
-def check_all_excels(customer_numbers, excel_files, columns_to_check):
-    """Check all customer numbers in all Excel files."""
+def extract_all_excels(customer_numbers, excel_files, columns_to_check):
+    """
+    Extract ColumnA and ColumnB for all customers from all Excel files.
+    Returns a nested dict: {excel_file: {customer_number: (ColumnA, ColumnB)}}
+    """
     all_results = {}
     for excel_file in excel_files:
         print(f"[INFO] Processing {excel_file} ...")
-        results = check_customers_in_excel(customer_numbers, excel_file, columns_to_check)
+        results = extract_columns_from_excel(customer_numbers, excel_file, columns_to_check)
         all_results[excel_file] = results
     return all_results
 
 
 def save_results(all_results, output_file):
     """Save the results to CSV."""
-    df = pd.DataFrame(all_results)
+    # Transform nested dict to flat dict for DataFrame
+    flat_data = {}
+    for excel_file, cust_map in all_results.items():
+        colA_name = f"{excel_file}_ColumnA"
+        colB_name = f"{excel_file}_ColumnB"
+        for cust, (colA_val, colB_val) in cust_map.items():
+            if cust not in flat_data:
+                flat_data[cust] = {}
+            flat_data[cust][colA_name] = colA_val
+            flat_data[cust][colB_name] = colB_val
+    
+    df = pd.DataFrame(flat_data).T  # transpose to have customers as rows
     df.index.name = "CustomerNumber"
     df.to_csv(output_file)
     print(f"[INFO] Results saved to {output_file}")
@@ -85,10 +100,10 @@ if __name__ == "__main__":
     customer_numbers = load_customer_numbers(FLAT_FILE_PATH)
     print(f"[INFO] Loaded {len(customer_numbers)} customer numbers.")
 
-    # 2. Check all Excel files
-    all_results = check_all_excels(customer_numbers, EXCEL_FILES, COLUMNS_TO_CHECK)
+    # 2. Extract ColumnA and ColumnB for all Excel files
+    all_results = extract_all_excels(customer_numbers, EXCEL_FILES, COLUMNS_TO_CHECK)
 
     # 3. Save results
     save_results(all_results, OUTPUT_FILE)
 
-    print("[INFO] Multi-column Excel search complete.")
+    print("[INFO] Customer ColumnA and ColumnB extraction complete.")
