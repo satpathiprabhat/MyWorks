@@ -5,11 +5,11 @@ Usage:
     import gtmdb_fis as gtm
     conn = gtm.connect(
         jdbc_url="jdbc:fisglobal:database=core;host=db-gw;port=6543;encrypt=com;poolsize=20",
-        driver_jar="/opt/fis/fisglobal-driver.jar",               # or "C:/path/to/driver.jar" on Windows
-        driver_class="com.fisglobal.jdbc.Driver",                 # confirm from vendor jar
+        driver_jar="/opt/fis/fisglobal-driver.jar",                 # Windows: r"C:\path\to\driver.jar"
+        driver_class="com.fisglobal.jdbc.Driver",                   # confirm from vendor jar/docs
         props={"user": "svc_user", "password": "******"},
-        jvm_args=["-Xms128m", "-Xmx512m"],                        # optional
-        classpath_extras=["/opt/fis/dep1.jar", "/opt/fis/dep2.jar"]  # optional, any extra jars
+        jvm_args=["-Xms128m", "-Xmx512m"],                          # optional
+        classpath_extras=["/opt/fis/dep1.jar", "/opt/fis/dep2.jar"] # optional
     )
 """
 
@@ -62,7 +62,6 @@ def connect(
     -----
     - JVM is started only once per process. Subsequent calls reuse it.
     - If the JVM is already started, any additional classpath jars cannot be added.
-      In that case, we log a warning if you pass new extras.
     """
     jars = _validate_and_collect_jars(driver_jar, classpath_extras or [])
 
@@ -72,7 +71,7 @@ def connect(
         jvm_args=list(jvm_args or []),
     )
 
-    # JayDeBeApi accepts a single jar path or a list of jar paths
+    # JayDeBeApi accepts str (single jar) or list (multiple)
     jar_arg = jars if len(jars) > 1 else jars[0]
     raw = jaydebeapi.connect(driver_class, jdbc_url, props or {}, jar_arg)
     return _Connection(raw)
@@ -91,7 +90,7 @@ def _validate_and_collect_jars(driver_jar: str, extras: Sequence[str]) -> List[s
     missing: List[str] = []
 
     for p in all_paths:
-        # Expand ~ and environment variables (works cross-platform)
+        # Expand ~ and environment variables (cross-platform)
         expanded = os.path.expandvars(os.path.expanduser(p))
         abs_path = os.path.abspath(expanded)
         if not os.path.isfile(abs_path):
@@ -102,7 +101,7 @@ def _validate_and_collect_jars(driver_jar: str, extras: Sequence[str]) -> List[s
     if missing:
         raise FileNotFoundError(
             f"JAR not found: {missing}. "
-            f"Current OS={platform.system()} cwd={os.getcwd()}"
+            f"OS={platform.system()} cwd={os.getcwd()}"
         )
 
     return normed
@@ -111,31 +110,61 @@ def _validate_and_collect_jars(driver_jar: str, extras: Sequence[str]) -> List[s
 def _ensure_jvm(classpath: Sequence[str], jvm_path: Optional[str], jvm_args: Sequence[str]) -> None:
     """
     Start the JVM if not already started, in a cross-platform safe way.
-
-    Key point: use JPype's `classpath=` kwarg so JPype's own support jar
-    (org.jpype.jar) stays visible. Avoid manually setting -Djava.class.path.
+    Explicitly inject JPype's support jar (org.jpype.jar) to avoid
+    'Can't find org.jpype.jar support library' on some systems.
     """
     if jpype.isJVMStarted():
-        # JVM already running; we cannot extend classpath now.
+        # JVM already running; can't extend classpath any further.
         if classpath:
             log.debug("JVM already started; classpath extras ignored on subsequent calls.")
         return
 
+    # Locate JPype's support jar if present
+    support_jar = None
+    try:
+        jpype_dir = os.path.dirname(jpype.__file__)
+        cand = os.path.join(jpype_dir, "org.jpype.jar")
+        if os.path.isfile(cand):
+            support_jar = cand
+    except Exception:
+        pass
+
+    # Build final classpath: [support_jar] + user jars (dedup, keep order)
+    seen = set()
+    jars: List[str] = []
+    if support_jar and support_jar not in seen:
+        jars.append(support_jar); seen.add(support_jar)
+    for p in classpath:
+        if p and p not in seen:
+            jars.append(p); seen.add(p)
+
+    # Guard against accidentally wiping the classpath via JVM args
+    bad_args = [a for a in jvm_args if a.strip().startswith("-Djava.class.path=")]
+    if bad_args:
+        raise RuntimeError(
+            "Do not pass -Djava.class.path in jvm_args; it overrides JPype's support jar. "
+            f"Remove: {bad_args}"
+        )
+
     # Resolve JVM path automatically if not supplied
     jvm = jvm_path or jpype.getDefaultJVMPath()
 
-    # Normalize and de-duplicate jar paths while preserving order
-    seen = set()
-    jars: List[str] = []
-    for p in classpath:
-        if p not in seen:
-            jars.append(p)
-            seen.add(p)
+    # Optional diagnostics
+    if os.environ.get("GTMDB_FIS_DEBUG", "0") not in ("", "0", "false", "False"):
+        print("[GTMDB_FIS] Starting JVM")
+        print("  OS         :", platform.platform())
+        print("  Python     :", platform.python_version(), os.sys.executable)
+        print("  JVM path   :", jvm)
+        print("  JVM args   :", list(jvm_args))
+        print("  Classpath  :")
+        for j in jars:
+            print("    -", j)
+        try:
+            print("  JPype dir  :", os.path.dirname(jpype.__file__))
+        except Exception:
+            pass
 
-    log.debug("Starting JVM\n  JVM: %s\n  ARGS: %s\n  CLASSPATH:\n    %s",
-              jvm, list(jvm_args), "\n    ".join(jars))
-
-    # Start the JVM; JPype appends its own support libs automatically
+    # Start JVM with explicit classpath (keeps JPype support jar visible)
     jpype.startJVM(jvm, *jvm_args, classpath=jars)
 
 
@@ -150,8 +179,18 @@ class _Connection:
         self._closed = False
 
     # --- PEP-249 required methods
-    def cursor(self):
-        return _Cursor(self._c.cursor())
+    def cursor(self, row_format: str | None = None):
+        """
+        Create a cursor. If row_format == 'dict', the fetch* methods will return dicts.
+        (This is an optional convenience; default remains tuple rows per DB-API.)
+        """
+        c = _Cursor(self._c.cursor())
+        if row_format == "dict":
+            # monkey-patch tuple fetchers to dict fetchers transparently
+            c.fetchone = c.fetchone_dict            # type: ignore[assignment]
+            c.fetchmany = c.fetchmany_dict          # type: ignore[assignment]
+            c.fetchall = c.fetchall_dict            # type: ignore[assignment]
+        return c
 
     def commit(self):
         self._c.commit()
@@ -189,7 +228,7 @@ class _Connection:
 
 
 class _Cursor:
-    """PEP-249 minimal cursor shim."""
+    """PEP-249 minimal cursor shim with optional dict-style fetch helpers."""
 
     arraysize = 1
 
@@ -197,9 +236,9 @@ class _Cursor:
         self._cur = raw_cursor
         self._closed = False
         self._rowcount = -1
-        self._description = None
+        self._description = None  # list of 7-item sequences per PEP-249
 
-    # PEP-249 attributes
+    # -------- PEP-249 attributes --------
     @property
     def description(self):
         return self._description
@@ -208,29 +247,29 @@ class _Cursor:
     def rowcount(self) -> int:
         return self._rowcount
 
-    # PEP-249 methods
-    def execute(self, operation: str, parameters: Optional[Iterable[Any]] = None):
+    # -------- PEP-249 methods (tuples) --------
+    def execute(self, operation: str, parameters=None):
         self._cur.execute(operation, list(parameters or []))
         self._rowcount = getattr(self._cur, "rowcount", -1)
         self._description = getattr(self._cur, "description", None)
         return self
 
-    def executemany(self, operation: str, seq_of_parameters: Iterable[Iterable[Any]]):
-        self._cur.executemany(operation, [list(p) for p in seq_of_parameters])
+    def executemany(self, operation: str, seq_of_parameters=None):
+        self._cur.executemany(operation, [list(p) for p in (seq_of_parameters or [])])
         self._rowcount = getattr(self._cur, "rowcount", -1)
         self._description = getattr(self._cur, "description", None)
         return self
 
-    def fetchone(self) -> Optional[Tuple[Any, ...]]:
+    def fetchone(self):
         r = self._cur.fetchone()
         return None if r is None else tuple(r)
 
-    def fetchmany(self, size: Optional[int] = None) -> List[Tuple[Any, ...]]:
+    def fetchmany(self, size: int | None = None):
         n = size or self.arraysize
         rows = self._cur.fetchmany(n)
         return [tuple(r) for r in rows]
 
-    def fetchall(self) -> List[Tuple[Any, ...]]:
+    def fetchall(self):
         rows = self._cur.fetchall()
         return [tuple(r) for r in rows]
 
@@ -240,3 +279,32 @@ class _Cursor:
                 self._cur.close()
             finally:
                 self._closed = True
+
+    # -------- New: column names & dict-style fetch --------
+    def columns(self) -> List[str]:
+        """Return column names based on cursor.description (PEP-249)."""
+        if not self._description:
+            return []
+        # Each description entry: (name, type_code, display_size, internal_size, precision, scale, null_ok)
+        return [d[0] for d in self._description]
+
+    def fetchone_dict(self) -> Optional[Dict[str, Any]]:
+        """Return next row as dict {col: value}, or None if no more rows."""
+        row = self._cur.fetchone()
+        if row is None:
+            return None
+        cols = self.columns()
+        return dict(zip(cols, row))
+
+    def fetchmany_dict(self, size: int | None = None) -> List[Dict[str, Any]]:
+        """Return up to `size` rows as list of dicts."""
+        n = size or self.arraysize
+        rows = self._cur.fetchmany(n)
+        cols = self.columns()
+        return [dict(zip(cols, r)) for r in rows]
+
+    def fetchall_dict(self) -> List[Dict[str, Any]]:
+        """Return all remaining rows as list of dicts."""
+        rows = self._cur.fetchall()
+        cols = self.columns()
+        return [dict(zip(cols, r)) for r in rows]
