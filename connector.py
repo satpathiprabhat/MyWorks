@@ -3,35 +3,11 @@ connector.py
 
 DB-API-style wrapper for vendor JDBC drivers using JPype + JayDeBeApi.
 
-Features:
- - Cross-platform JVM startup that preserves JPype's support jar
- - Validation of driver JARs
- - Cursor with tuple/dict fetch helpers
- - callproc(...) using JDBC CallableStatement with fallback to executeQuery()/executeUpdate()
- - Helper conversions from Java objects to Python-friendly types
-
-Usage:
-    conn = connect(
-        jdbc_url="jdbc:fisglobal:database=core;host=...;port=6543",
-        driver_jar="/path/to/ScJDBC-3.8.10.1.jar",
-        driver_class="com.fisglobal.jdbc.Driver",
-        props={"user": "svc", "password": "xxx"},
-        jvm_path=r"C:\Program Files\Java\jdk-17\bin\server\jvm.dll"  # optional if JPype cannot find JVM
-    )
-
-    # SQL usage (JayDeBeApi)
-    cur = conn.cursor(row_format="dict")
-    cur.execute("SELECT 1")
-    print(cur.fetchall())
-
-    # CALLABLE usage
-    result = conn.callproc(
-        "xmrpc",
-        in_params=[777, 1, "MB", None],
-        out_param_types=[None, None, None, "VARCHAR"],
-        result_as_dict=True,
-    )
-    print(result)
+Enhanced callproc() with:
+ - explicit Java type conversion for IN parameters
+ - optional param_types for IN params
+ - type-aware OUT getters
+ - debug prints (GTMDB_FIS_DEBUG=1)
 """
 
 from __future__ import annotations
@@ -44,13 +20,81 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import jpype
 import jaydebeapi
-from jpype import JClass, JException
+from jpype import JClass, JException, JString, JInt, JLong, JDouble, JBoolean, JArray, JByte
 
 log = logging.getLogger(__name__)
 
 
-# ----------------------------- Public API -----------------------------------
+# ---------- small mappings / helpers for SQL type -> getter or JPype creator ----------
 
+SQLTYPE_TO_GETTER = {
+    "VARCHAR": "getString",
+    "CHAR": "getString",
+    "LONGVARCHAR": "getString",
+    "CLOB": "getString",
+    "INTEGER": "getInt",
+    "INT": "getInt",
+    "SMALLINT": "getInt",
+    "BIGINT": "getLong",
+    "DECIMAL": "getBigDecimal",
+    "NUMERIC": "getBigDecimal",
+    "DOUBLE": "getDouble",
+    "FLOAT": "getDouble",
+    "REAL": "getDouble",
+    "BOOLEAN": "getBoolean",
+    "BIT": "getBoolean",
+    "BINARY": "getBytes",
+    "VARBINARY": "getBytes",
+    "BLOB": "getBytes",
+    "TIMESTAMP": "getTimestamp",
+    "DATE": "getDate",
+    "TIME": "getTime",
+}
+
+
+def _py_to_java_for_sql(val: Any, sql_type_name: Optional[str]):
+    """Convert common Python values to Java objects appropriate for a SQL type."""
+    if val is None:
+        return None
+    t = (sql_type_name or "").upper()
+    try:
+        if t in ("VARCHAR", "CHAR", "LONGVARCHAR", "CLOB", "DATE", "TIME", "TIMESTAMP"):
+            return JString(str(val))
+        if t in ("INTEGER", "INT", "SMALLINT"):
+            return JInt(int(val))
+        if t in ("BIGINT",):
+            return JLong(int(val))
+        if t in ("DOUBLE", "FLOAT", "REAL"):
+            return JDouble(float(val))
+        if t in ("BOOLEAN", "BIT"):
+            return JBoolean(bool(val))
+        if t in ("BINARY", "VARBINARY", "BLOB"):
+            # create Java byte[] via JPype JArray(JByte)
+            b = bytes(val) if not isinstance(val, (bytes, bytearray)) else val
+            JByteArr = JArray(JByte)
+            return JByteArr(b)
+    except Exception:
+        # fallback to string
+        return JString(str(val))
+    # default fallback
+    return JString(str(val))
+
+
+def _java_to_python(jobj: Any) -> Any:
+    """Convert common Java objects to Python-friendly types."""
+    if jobj is None:
+        return None
+    try:
+        # If it has toString, use it (safe human-readable)
+        if hasattr(jobj, "toString"):
+            return str(jobj.toString())
+    except Exception:
+        pass
+    # Default: JPype may already give Python primitive
+    return jobj
+
+
+# ----------------------------- core connection/cursor & JVM startup -----------------------------
 
 def connect(
     jdbc_url: str,
@@ -61,67 +105,38 @@ def connect(
     jvm_args: Optional[Sequence[str]] = None,
     classpath_extras: Optional[Sequence[str]] = None,
 ):
-    """
-    Create and return a DB-API like connection wrapper.
-
-    - jdbc_url: JDBC connection URL for the driver
-    - driver_jar: path to primary vendor jar
-    - driver_class: fully qualified driver class name
-    - props: dict of JDBC properties (user/password/etc.)
-    - jvm_path: explicit path to jvm library (optional)
-    - jvm_args: list of JVM args, e.g. ["-Xmx512m"]
-    - classpath_extras: list of additional jars required by the driver
-    """
     jars = _validate_and_collect_jars(driver_jar, list(classpath_extras or []))
     _ensure_jvm(classpath=jars, jvm_path=jvm_path, jvm_args=list(jvm_args or []))
-
-    # JayDeBeApi accepts a single jar path (str) or list of jar paths
     jar_arg = jars if len(jars) > 1 else jars[0]
     raw = jaydebeapi.connect(driver_class, jdbc_url, props or {}, jar_arg)
     return _Connection(raw)
 
 
-# ----------------------------- Internals ------------------------------------
-
-
 def _validate_and_collect_jars(driver_jar: str, extras: Sequence[str]) -> List[str]:
-    """
-    Normalize and verify jar paths. Return absolute list of jar paths.
-    Raise FileNotFoundError with clear message if missing.
-    """
     all_paths = [driver_jar] + list(extras)
     normed: List[str] = []
     missing: List[str] = []
-
     for p in all_paths:
         expanded = os.path.expandvars(os.path.expanduser(p))
-        abs_path = str(Path(expanded).resolve())
+        try:
+            abs_path = str(Path(expanded).resolve())
+        except Exception:
+            abs_path = expanded
         if not Path(abs_path).is_file():
             missing.append(p)
         else:
             normed.append(abs_path)
-
     if missing:
-        raise FileNotFoundError(
-            f"JAR(s) not found: {missing}. OS={platform.system()} cwd={os.getcwd()}"
-        )
+        raise FileNotFoundError(f"JAR(s) not found: {missing}. OS={platform.system()} cwd={os.getcwd()}")
     return normed
 
 
 def _ensure_jvm(classpath: Sequence[str], jvm_path: Optional[str], jvm_args: Sequence[str]) -> None:
-    """
-    Start the JVM safely:
-
-    - Avoid overriding JPype support jar.
-    - Explicitly include JPype support jar if present.
-    - Use jpype.startJVM(..., classpath=jars) rather than -Djava.class.path=...
-    """
     if jpype.isJVMStarted():
         if classpath:
-            log.debug("JVM already started; additional classpath entries will be ignored.")
+            log.debug("JVM already started; extra classpath entries ignored.")
         return
 
-    # Find JPype support jar (org.jpype.jar) if available next to module
     support_jar = None
     try:
         jpype_dir = Path(jpype.__file__).parent
@@ -131,21 +146,17 @@ def _ensure_jvm(classpath: Sequence[str], jvm_path: Optional[str], jvm_args: Seq
     except Exception:
         support_jar = None
 
-    # Final classpath: support jar first (if found), then user jars (dedup preserve order)
     seen = set()
     jars: List[str] = []
     if support_jar and support_jar not in seen:
-        jars.append(support_jar)
-        seen.add(support_jar)
+        jars.append(support_jar); seen.add(support_jar)
     for p in classpath:
         if p and p not in seen:
-            jars.append(p)
-            seen.add(p)
+            jars.append(p); seen.add(p)
 
-    # Prevent user from accidentally overriding classpath via jvm_args
     bad = [a for a in jvm_args if a.strip().startswith("-Djava.class.path=")]
     if bad:
-        raise RuntimeError("Do not pass -Djava.class.path in jvm_args; it would hide JPype's support jar.")
+        raise RuntimeError("Do not pass -Djava.class.path in jvm_args; JPype manages support jar.")
 
     jvm = jvm_path or jpype.getDefaultJVMPath()
     debug_on = os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes")
@@ -157,46 +168,30 @@ def _ensure_jvm(classpath: Sequence[str], jvm_path: Optional[str], jvm_args: Seq
         print("  Classpath entries:")
         for x in jars:
             print("    -", x)
-        try:
-            print("  JPype dir:", Path(jpype.__file__).parent)
-        except Exception:
-            pass
-
     jpype.startJVM(jvm, *jvm_args, classpath=jars)
 
 
-# ----------------------------- DB-API shims ---------------------------------
-
+# ----------------------------- DB-API shims (Connection & Cursor) -----------------------------
 
 class _Connection:
-    """Thin wrapper that exposes commit/rollback/close and callproc support."""
-
     def __init__(self, raw_conn):
-        # raw_conn is jaydebeapi connection object
         self._c = raw_conn
         self._closed = False
 
     def cursor(self, row_format: Optional[str] = None):
         c = _Cursor(self._c.cursor())
         if row_format == "dict":
-            # monkey-patch standard fetchers to dict versions
             c.fetchone = c.fetchone_dict  # type: ignore
             c.fetchmany = c.fetchmany_dict  # type: ignore
             c.fetchall = c.fetchall_dict  # type: ignore
         return c
 
-    def commit(self):
-        self._c.commit()
-
-    def rollback(self):
-        self._c.rollback()
-
+    def commit(self): self._c.commit()
+    def rollback(self): self._c.rollback()
     def close(self):
         if not self._closed:
-            try:
-                self._c.close()
-            finally:
-                self._closed = True
+            try: self._c.close()
+            finally: self._closed = True
 
     @property
     def autocommit(self) -> bool:
@@ -206,9 +201,7 @@ class _Connection:
     def autocommit(self, on: bool) -> None:
         getattr(self._c.jconn, "setAutoCommit")(bool(on))
 
-    def __enter__(self):
-        return self
-
+    def __enter__(self): return self
     def __exit__(self, exc_type, exc, tb):
         try:
             if exc_type and not self.autocommit:
@@ -218,107 +211,148 @@ class _Connection:
         finally:
             self.close()
 
-    # ---------------- CallableStatement support ----------------
+    # ---------------- callproc: improved version ----------------
     def callproc(
         self,
         proc_name: str,
         in_params: Optional[Sequence[Any]] = None,
         out_param_types: Optional[Sequence[Optional[str]]] = None,
+        param_types: Optional[Sequence[Optional[str]]] = None,
         result_as_dict: bool = False,
     ) -> Dict[str, Any]:
         """
         Call a stored procedure using JDBC CallableStatement.
 
-        - proc_name: name of the stored procedure (no surrounding braces)
-        - in_params: list of IN parameter values (put None for OUT placeholders if needed)
-        - out_param_types: list aligned to parameter positions with java.sql.Types names (e.g. "VARCHAR")
-                           use None for positions that are not OUT params
-        - result_as_dict: if True, convert resultset rows to dicts (colname -> value)
-
-        Returns: {"out_params": [...], "result_rows": [...]}
+        - proc_name: name of the procedure (no surrounding braces)
+        - in_params: list of IN values (use None as placeholder for OUT positions)
+        - out_param_types: list of SQL TYPE NAMES (e.g. "VARCHAR") aligned to positions, or None
+        - param_types: optional list of SQL TYPE NAMES for IN params (for precise marshalling)
+        - result_as_dict: return rows as dicts if True
         """
-        # Extract underlying java.sql.Connection exposed by jaydebeapi as .jconn
         raw_jconn = getattr(self._c, "jconn", None)
         if raw_jconn is None:
-            raise RuntimeError("Underlying JDBC 'jconn' not available - cannot perform CallableStatement calls")
+            raise RuntimeError("Underlying JDBC 'jconn' not available")
 
         in_params = list(in_params or [])
         out_types = list(out_param_types or [])
+        param_types = list(param_types or [])
+
         total_params = max(len(in_params), len(out_types), 0)
         placeholders = ",".join(["?"] * total_params) if total_params > 0 else ""
         call_syntax = f"{{call {proc_name}({placeholders})}}" if placeholders else f"{{call {proc_name}()}}"
 
-        # Prepare the callable
+        if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+            print("[callproc] call_syntax:", call_syntax)
+            print("[callproc] in_params:", in_params)
+            print("[callproc] out_types:", out_types)
+            print("[callproc] param_types:", param_types)
+
         cstmt = raw_jconn.prepareCall(call_syntax)
         SQLTypes = JClass("java.sql.Types")
 
-        # Set IN params and register OUT params
+        # Set IN params (type-aware) and register OUT params
         for i in range(total_params):
             idx = i + 1
+
+            # Determine IN SQL type hint for marshalling
+            in_sql_type = None
+            if i < len(param_types) and param_types[i]:
+                in_sql_type = param_types[i].upper()
+            elif i < len(out_types) and out_types[i]:
+                in_sql_type = out_types[i].upper()
+            else:
+                in_sql_type = "VARCHAR"  # safe fallback
+
+            # Set IN param if provided
             if i < len(in_params):
-                val = in_params[i]
+                raw_val = in_params[i]
+                jval = _py_to_java_for_sql(raw_val, in_sql_type)
+                if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                    print(f"[callproc] set IN idx={idx} sqltype={in_sql_type} pyval={raw_val} jval_type={type(jval)}")
+                # Use type-specific setters where possible
                 try:
-                    cstmt.setObject(idx, val)
-                except Exception:
-                    # fallback to string representation
-                    cstmt.setObject(idx, str(val) if val is not None else None)
+                    if in_sql_type in ("INTEGER", "INT", "SMALLINT"):
+                        cstmt.setInt(idx, int(raw_val) if raw_val is not None else None)
+                    elif in_sql_type == "BIGINT":
+                        cstmt.setLong(idx, int(raw_val) if raw_val is not None else None)
+                    elif in_sql_type in ("DOUBLE", "FLOAT", "REAL"):
+                        cstmt.setDouble(idx, float(raw_val) if raw_val is not None else None)
+                    elif in_sql_type in ("BOOLEAN", "BIT"):
+                        cstmt.setBoolean(idx, bool(raw_val))
+                    else:
+                        cstmt.setObject(idx, jval)
+                except Exception as ex:
+                    if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                        print(f"[callproc] typed set failed idx={idx}: {ex}; falling back to setObject(str)")
+                    try:
+                        cstmt.setObject(idx, JString(str(raw_val)) if raw_val is not None else None)
+                    except Exception:
+                        cstmt.setObject(idx, None)
+
+            # Register OUT param if needed
             if i < len(out_types) and out_types[i]:
                 tname = out_types[i].upper()
                 if not hasattr(SQLTypes, tname):
                     raise ValueError(f"Unknown java.sql.Types name: {tname}")
                 jtype = getattr(SQLTypes, tname)
+                if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                    print(f"[callproc] register OUT idx={idx} type={tname}")
                 cstmt.registerOutParameter(idx, jtype)
 
-        # Execute in a robust fashion (drivers sometimes demand executeQuery or executeUpdate)
+        # Execute robustly
         try:
             rs_obj, update_count = _try_execute_callable(cstmt)
-        except Exception as exc:
-            try:
-                cstmt.close()
-            except Exception:
-                pass
+        except Exception:
+            try: cstmt.close()
+            except Exception: pass
             raise
 
-        # Convert resultset (if any)
+        # Convert result rows
         rows: List[Any] = []
         if rs_obj is not None:
             rows = _resultset_to_python(rs_obj, as_dict=result_as_dict)
         elif update_count is not None:
             rows = [("UPDATE_COUNT", int(update_count))]
 
-        # Collect OUT params
+        # Read OUT params with type-specific getters
         out_values: List[Any] = []
         for i in range(total_params):
             if i < len(out_types) and out_types[i]:
+                tname = out_types[i].upper()
+                getter = SQLTYPE_TO_GETTER.get(tname)
+                idx = i + 1
                 try:
-                    val = cstmt.getObject(i + 1)
+                    if getter and hasattr(cstmt, getter):
+                        val = getattr(cstmt, getter)(idx)
+                    else:
+                        val = cstmt.getObject(idx)
                     out_values.append(_java_to_python(val))
-                except Exception:
-                    out_values.append(None)
+                except Exception as ex:
+                    if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                        print(f"[callproc] OUT getter failed idx={idx} type={tname}: {ex}")
+                    # try generic getObject as fallback
+                    try:
+                        out_values.append(_java_to_python(cstmt.getObject(idx)))
+                    except Exception:
+                        out_values.append(None)
             else:
                 out_values.append(None)
 
-        # Close statement
-        try:
-            cstmt.close()
-        except Exception:
-            pass
+        try: cstmt.close()
+        except Exception: pass
 
         return {"out_params": out_values, "result_rows": rows}
 
 
 class _Cursor:
-    """Minimal DB-API cursor wrapper with dict helpers."""
-
     arraysize = 1
 
     def __init__(self, raw_cursor):
         self._cur = raw_cursor
         self._closed = False
         self._rowcount = -1
-        self._description = None  # PEP-249: sequence of 7-item tuples
+        self._description = None
 
-    # PEP-249 attributes
     @property
     def description(self):
         return self._description
@@ -327,7 +361,6 @@ class _Cursor:
     def rowcount(self) -> int:
         return self._rowcount
 
-    # PEP-249 methods (tuple-based)
     def execute(self, operation: str, parameters: Optional[Iterable[Any]] = None):
         self._cur.execute(operation, list(parameters or []))
         self._rowcount = getattr(self._cur, "rowcount", -1)
@@ -355,12 +388,10 @@ class _Cursor:
 
     def close(self):
         if not self._closed:
-            try:
-                self._cur.close()
-            finally:
-                self._closed = True
+            try: self._cur.close()
+            finally: self._closed = True
 
-    # Dict-style helpers
+    # dict helpers
     def columns(self) -> List[str]:
         if not self._description:
             return []
@@ -382,30 +413,9 @@ class _Cursor:
         return [dict(zip(self.columns(), r)) for r in rows]
 
 
-# ----------------------------- Helper functions -----------------------------
-
-
-def _java_to_python(jobj: Any) -> Any:
-    """
-    Convert certain Java objects to Python-friendly types.
-    - Strings and primitives are usually auto-mapped by JPype.
-    - For java.sql.Timestamp/Date we return ISO string (safe).
-    - Fallback: str(jobj).
-    """
-    if jobj is None:
-        return None
-    try:
-        # java.sql.Timestamp, java.sql.Date typically have toString()
-        if hasattr(jobj, "toString"):
-            return str(jobj.toString())
-    except Exception:
-        pass
-    # If JPype already mapped it to a Python primitive, return as-is
-    return jobj
-
+# ----------------------------- Helpers for callable execution -----------------------------
 
 def _resultset_to_python(rs, as_dict: bool = False) -> List[Any]:
-    """Convert java.sql.ResultSet to list of Python tuples or dicts."""
     rows: List[Any] = []
     if rs is None:
         return rows
@@ -421,25 +431,21 @@ def _resultset_to_python(rs, as_dict: bool = False) -> List[Any]:
                 v = None
             vals.append(_java_to_python(v))
         rows.append(dict(zip(col_names, vals)) if as_dict else tuple(vals))
-    try:
-        rs.close()
-    except Exception:
-        pass
+    try: rs.close()
+    except Exception: pass
     return rows
 
 
 def _try_execute_callable(cstmt):
     """
-    Try to execute CallableStatement, handling drivers that require executeQuery() or executeUpdate().
-
-    Returns: (resultset_obj_or_None, update_count_or_None)
+    Execute a CallableStatement robustly.
+    Returns (resultset_obj_or_None, update_count_or_None)
     """
     try:
         has_rs = cstmt.execute()
     except JException as ex:
-        # Inspect message to detect driver guidance
         msg = str(ex)
-        # If driver instructs executeQuery()
+        # heuristics: drivers often mention executeQuery or executeUpdate in message
         if "executeQuery" in msg or "executequery" in msg.lower():
             try:
                 rs = cstmt.executeQuery()
@@ -452,10 +458,8 @@ def _try_execute_callable(cstmt):
                 return None, upd
             except Exception as e:
                 raise RuntimeError("CallableStatement.executeUpdate() failed") from e
-        # Unknown SQL exception - rethrow
         raise
 
-    # If execute returned True -> there's a ResultSet
     if has_rs:
         try:
             rs = cstmt.getResultSet()
@@ -463,7 +467,6 @@ def _try_execute_callable(cstmt):
         except Exception:
             return None, None
 
-    # execute returned False -> check update count
     try:
         update_count = cstmt.getUpdateCount()
         if update_count is not None and int(update_count) != -1:
@@ -471,7 +474,7 @@ def _try_execute_callable(cstmt):
     except Exception:
         pass
 
-    # As last resort some drivers still need executeQuery even if execute returned False
+    # last resort try executeQuery
     try:
         rs = cstmt.executeQuery()
         return rs, None
