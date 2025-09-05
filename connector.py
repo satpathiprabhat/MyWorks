@@ -3,11 +3,20 @@ connector.py
 
 DB-API-style wrapper for vendor JDBC drivers using JPype + JayDeBeApi.
 
-Enhanced callproc() with:
- - explicit Java type conversion for IN parameters
- - optional param_types for IN params
- - type-aware OUT getters
- - debug prints (GTMDB_FIS_DEBUG=1)
+Enhancements:
+ - Auto-convert Python list/tuple in IN parameters to Java String[] (common ScJDBC pattern)
+ - param_types support for IN typing hints
+ - robust CallableStatement execution with execute/executeQuery fallback
+ - dict/tuple fetch helpers
+ - cross-platform JVM startup that keeps JPype support jar visible
+
+Usage example (auto-conversion):
+    res = conn.callproc(
+        "xmrpc",
+        in_params=["738", "1", ["APPID", "123456789"], None],
+        out_param_types=[None, None, None, "VARCHAR"],
+        result_as_dict=True
+    )
 """
 
 from __future__ import annotations
@@ -69,14 +78,11 @@ def _py_to_java_for_sql(val: Any, sql_type_name: Optional[str]):
         if t in ("BOOLEAN", "BIT"):
             return JBoolean(bool(val))
         if t in ("BINARY", "VARBINARY", "BLOB"):
-            # create Java byte[] via JPype JArray(JByte)
             b = bytes(val) if not isinstance(val, (bytes, bytearray)) else val
             JByteArr = JArray(JByte)
             return JByteArr(b)
     except Exception:
-        # fallback to string
         return JString(str(val))
-    # default fallback
     return JString(str(val))
 
 
@@ -85,16 +91,27 @@ def _java_to_python(jobj: Any) -> Any:
     if jobj is None:
         return None
     try:
-        # If it has toString, use it (safe human-readable)
         if hasattr(jobj, "toString"):
             return str(jobj.toString())
     except Exception:
         pass
-    # Default: JPype may already give Python primitive
     return jobj
 
 
-# ----------------------------- core connection/cursor & JVM startup -----------------------------
+def _convert_py_sequence_to_jstring_array(seq: Sequence[Any]):
+    """
+    Convert a Python list/tuple to a Java String[] using JPype.
+
+    Elements are converted via JString(str(element)).
+    """
+    JStr = JClass("java.lang.String")
+    JStrArr = JArray(JStr)
+    # Convert each element to Java String
+    j_elems = [JString(str(x)) if x is not None else None for x in seq]
+    return JStrArr(j_elems)
+
+
+# ----------------------------- core connect & JVM startup -----------------------------
 
 def connect(
     jdbc_url: str,
@@ -211,7 +228,7 @@ class _Connection:
         finally:
             self.close()
 
-    # ---------------- callproc: improved version ----------------
+    # ---------------- callproc with auto-conversion of Python sequences to Java String[] ----------------
     def callproc(
         self,
         proc_name: str,
@@ -223,11 +240,9 @@ class _Connection:
         """
         Call a stored procedure using JDBC CallableStatement.
 
-        - proc_name: name of the procedure (no surrounding braces)
-        - in_params: list of IN values (use None as placeholder for OUT positions)
-        - out_param_types: list of SQL TYPE NAMES (e.g. "VARCHAR") aligned to positions, or None
-        - param_types: optional list of SQL TYPE NAMES for IN params (for precise marshalling)
-        - result_as_dict: return rows as dicts if True
+        - If an element of in_params is a Python list/tuple, it will be converted
+          into a Java String[] automatically (common ScJDBC pattern).
+        - param_types: optional SQL type hints for IN params (e.g. ["INTEGER", None, "VARCHAR"])
         """
         raw_jconn = getattr(self._c, "jconn", None)
         if raw_jconn is None:
@@ -236,6 +251,13 @@ class _Connection:
         in_params = list(in_params or [])
         out_types = list(out_param_types or [])
         param_types = list(param_types or [])
+
+        # Auto-convert Python sequences found in in_params into Java String[] objects
+        for i, v in enumerate(in_params):
+            if isinstance(v, (list, tuple)):
+                if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                    print(f"[callproc] auto-converting in_params[{i}] (Python sequence) -> Java String[]")
+                in_params[i] = _convert_py_sequence_to_jstring_array(v)
 
         total_params = max(len(in_params), len(out_types), 0)
         placeholders = ",".join(["?"] * total_params) if total_params > 0 else ""
@@ -261,33 +283,44 @@ class _Connection:
             elif i < len(out_types) and out_types[i]:
                 in_sql_type = out_types[i].upper()
             else:
-                in_sql_type = "VARCHAR"  # safe fallback
+                in_sql_type = "VARCHAR"
 
-            # Set IN param if provided
+            # Set IN param if present
             if i < len(in_params):
                 raw_val = in_params[i]
-                jval = _py_to_java_for_sql(raw_val, in_sql_type)
-                if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
-                    print(f"[callproc] set IN idx={idx} sqltype={in_sql_type} pyval={raw_val} jval_type={type(jval)}")
-                # Use type-specific setters where possible
-                try:
-                    if in_sql_type in ("INTEGER", "INT", "SMALLINT"):
-                        cstmt.setInt(idx, int(raw_val) if raw_val is not None else None)
-                    elif in_sql_type == "BIGINT":
-                        cstmt.setLong(idx, int(raw_val) if raw_val is not None else None)
-                    elif in_sql_type in ("DOUBLE", "FLOAT", "REAL"):
-                        cstmt.setDouble(idx, float(raw_val) if raw_val is not None else None)
-                    elif in_sql_type in ("BOOLEAN", "BIT"):
-                        cstmt.setBoolean(idx, bool(raw_val))
-                    else:
-                        cstmt.setObject(idx, jval)
-                except Exception as ex:
-                    if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
-                        print(f"[callproc] typed set failed idx={idx}: {ex}; falling back to setObject(str)")
+                # If the raw_val is a JPype java array/object already, set directly
+                if hasattr(raw_val, "__javaclass__") or isinstance(raw_val, (JClass,)):
                     try:
-                        cstmt.setObject(idx, JString(str(raw_val)) if raw_val is not None else None)
-                    except Exception:
-                        cstmt.setObject(idx, None)
+                        cstmt.setObject(idx, raw_val)
+                        if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                            print(f"[callproc] set IN idx={idx} using JPype java object (auto-converted)")
+                    except Exception as ex:
+                        if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                            print(f"[callproc] failed setObject for JPype object idx={idx}: {ex}")
+                        cstmt.setObject(idx, JString(str(raw_val)))
+                else:
+                    # Normal marshalling
+                    jval = _py_to_java_for_sql(raw_val, in_sql_type)
+                    if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                        print(f"[callproc] set IN idx={idx} sqltype={in_sql_type} pyval={raw_val} jval_type={type(jval)}")
+                    try:
+                        if in_sql_type in ("INTEGER", "INT", "SMALLINT"):
+                            cstmt.setInt(idx, int(raw_val) if raw_val is not None else None)
+                        elif in_sql_type == "BIGINT":
+                            cstmt.setLong(idx, int(raw_val) if raw_val is not None else None)
+                        elif in_sql_type in ("DOUBLE", "FLOAT", "REAL"):
+                            cstmt.setDouble(idx, float(raw_val) if raw_val is not None else None)
+                        elif in_sql_type in ("BOOLEAN", "BIT"):
+                            cstmt.setBoolean(idx, bool(raw_val))
+                        else:
+                            cstmt.setObject(idx, jval)
+                    except Exception as ex:
+                        if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                            print(f"[callproc] typed set failed idx={idx}: {ex}; falling back to setObject(str)")
+                        try:
+                            cstmt.setObject(idx, JString(str(raw_val)) if raw_val is not None else None)
+                        except Exception:
+                            cstmt.setObject(idx, None)
 
             # Register OUT param if needed
             if i < len(out_types) and out_types[i]:
@@ -330,7 +363,6 @@ class _Connection:
                 except Exception as ex:
                     if os.getenv("GTMDB_FIS_DEBUG", "0").lower() in ("1", "true", "yes"):
                         print(f"[callproc] OUT getter failed idx={idx} type={tname}: {ex}")
-                    # try generic getObject as fallback
                     try:
                         out_values.append(_java_to_python(cstmt.getObject(idx)))
                     except Exception:
@@ -445,7 +477,6 @@ def _try_execute_callable(cstmt):
         has_rs = cstmt.execute()
     except JException as ex:
         msg = str(ex)
-        # heuristics: drivers often mention executeQuery or executeUpdate in message
         if "executeQuery" in msg or "executequery" in msg.lower():
             try:
                 rs = cstmt.executeQuery()
@@ -474,7 +505,6 @@ def _try_execute_callable(cstmt):
     except Exception:
         pass
 
-    # last resort try executeQuery
     try:
         rs = cstmt.executeQuery()
         return rs, None
