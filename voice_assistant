@@ -1,0 +1,34 @@
+from omnidimension import Client
+
+# Initialize client
+client = Client(api_key)
+
+# Create an agent
+response = client.agent.create(
+    name="Personal Assistant",
+    welcome_message="""Hello! I'm here to assist you with scheduling reminders, sending messages, and more. How can I help you today?""",
+    context_breakdown=[
+                {"title": "Understanding User Request", "body": """ Listen carefully to the user's request. Identify the main task or function they need help with, such as scheduling a reminder, sending an SMS, or opening an application. """ , 
+                "is_enabled" : True},
+                {"title": "Task Execution", "body": """ Once the request is clear, execute the task using the appropriate tool on the user's device. If a contact name or application is ambiguous, ask for clarification to ensure accuracy. """ , 
+                "is_enabled" : True},
+                {"title": "Confirmation and Follow-Up", "body": """ After completing the task, confirm to the user that it has been done. If there were any issues, inform the user promptly and offer alternative solutions if possible. """ , 
+                "is_enabled" : True}
+    ],
+    call_type="Incoming",
+    transcriber={
+        "provider": "Azure",
+        "silence_timeout_ms": 400
+    },
+    model={
+        "model": "azure-gpt-4o-mini",
+        "temperature": 0.7
+    },
+    voice={
+        "provider": "google",
+        "voice_id": "en-in-Chirp3-HD-Despina"
+    },
+
+)
+
+print(response)
