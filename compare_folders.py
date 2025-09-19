@@ -255,4 +255,32 @@ def main():
     summary_paths = []
 
     if mode_val in ("A_TO_B", "BOTH"):
-        print(f"Running A ->
+        print(f"Running A -> all B ID presence pass: {folderA} -> {folderB}")
+        results_a_to_b = run_pass_ids(folderA, folderB, output_dir, NUM_WORKER_THREADS)
+        sp = write_ids_summary(results_a_to_b, output_dir, pass_label="A_to_B")
+        summary_paths.append(sp)
+
+    if mode_val in ("B_TO_A", "BOTH"):
+        print(f"Running B -> all A ID presence pass: {folderB} -> {folderA}")
+        results_b_to_a = run_pass_ids(folderB, folderA, output_dir, NUM_WORKER_THREADS)
+        sp = write_ids_summary(results_b_to_a, output_dir, pass_label="B_to_A")
+        summary_paths.append(sp)
+
+    if len(summary_paths) > 1:
+        master = output_dir / "ids_presence_summary.master.txt"
+        with master.open('w', encoding='utf-8') as m:
+            m.write(f"# Master ID presence summary for all passes\n")
+            m.write(f"# Run timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            for sp in summary_paths:
+                m.write(f"--- {sp.name} ---\n")
+                m.write(sp.read_text())
+                m.write("\n\n")
+        print(f"Master summary written: {master}")
+
+    print("\nDone. Per-source files and summary files are available in:", output_dir)
+    for p in sorted(output_dir.iterdir()):
+        if p.is_file():
+            print(" -", p.name)
+
+if __name__ == "__main__":
+    main()
