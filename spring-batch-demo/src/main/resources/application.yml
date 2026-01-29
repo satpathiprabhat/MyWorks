@@ -1,0 +1,17 @@
+
+spring:
+  datasource:
+    url: jdbc:oracle:thin:@//localhost:1521/ORCL
+    username: vault
+    password: vault
+    driver-class-name: oracle.jdbc.OracleDriver
+  batch:
+    jdbc:
+      initialize-schema: always
+
+migration:
+  chunk-size: 500
+  partitions: 4
+  retry-limit: 3
+  hsm:
+    max-concurrency: 5
